@@ -170,47 +170,81 @@ Il sistema seleziona la gerarchia appropriata in funzione della natura della cla
 
 ---
 
-## GitHub Integration
+## GitHub Integration and Authorization Model
 
-Il framework supporta l'interazione con GitHub tramite connettore MCP, plugin o GitHub App, ma ogni operazione di scrittura è vincolata a un `authority_envelope` esplicito.
+Il framework supporta il dialogo diretto con GitHub tramite connettore ChatGPT, MCP server, GitHub App o Personal Access Token.
 
-La disponibilità di un tool MCP non autorizza di per sé la sua esecuzione: l'agente deve verificare repository, branch, permessi, rischio e approvazione richiesta prima di agire.
+L'impostazione ChatGPT **Allow all actions** autorizza l'assistente a invocare i tool disponibili, ma **non concede da sola permessi di scrittura a GitHub**. L'autorizzazione effettiva dipende dai permessi configurati sulla GitHub App, sul fine-grained PAT o sul token OAuth utilizzato dall'integrazione.
 
-### Supported GitHub operations
+```text
+CHATGPT ACTION PERMISSION
+≠ GITHUB REPOSITORY WRITE AUTHORIZATION
+```
 
-| Operazione | Classificazione | Autorizzazione richiesta |
+### Required GitHub permissions
+
+Per consentire branch, commit, modifiche ai file e Pull Request avviate dal dialogo con ChatGPT, l'integrazione GitHub deve avere almeno i seguenti permessi:
+
+| Permesso GitHub | Livello richiesto | Finalità |
 |---|---|---|
-| Lettura repository, file, issue e PR | Read | Consenso connessione + accesso repository |
-| Ricerca codice, documentazione e cronologia | Read | Consenso connessione + accesso repository |
-| Creazione branch | Write | `contents: write` + policy repository |
-| Commit su branch non protetto | Write | `contents: write` + approvazione secondo policy |
-| Apertura Pull Request | Write | `contents: write` + `pull_requests: write` |
-| Commento su issue o Pull Request | Write | `issues: write` oppure `pull_requests: write` |
-| Modifica di `.github/workflows/` | High-risk write | `contents: write` + `workflows: write` + human approval |
-| Merge di Pull Request | High-risk write | `pull_requests: write` + human approval |
-| Cancellazione branch, release o repository | Destructive | Esplicitamente vietata di default |
-
-### Minimum GitHub permissions
-
-Per consentire la creazione di branch e Pull Request dall'assistente, configurare l'integrazione con i seguenti permessi minimi:
-
-| Permesso GitHub | Livello | Finalità |
-|---|---:|---|
 | `Metadata` | Read | Accesso di base al repository |
-| `Contents` | Read and write | Lettura file, creazione branch, commit e modifica contenuti |
-| `Pull requests` | Read and write | Apertura, aggiornamento e gestione delle Pull Request |
-| `Issues` | Read, oppure Read and write | Lettura issue; scrittura solo se abilitata dalla policy |
-| `Workflows` | Read and write | Solo se l'agente è autorizzato a modificare GitHub Actions |
+| `Contents` | **Read and write** | Lettura file, creazione branch, commit, modifica e creazione file |
+| `Pull requests` | **Read and write** | Apertura, aggiornamento, commento e gestione delle Pull Request |
+| `Issues` | Read, oppure Read and write | Lettura issue; scrittura solo se espressamente abilitata |
+| `Workflows` | **Read and write** | Solo per modifiche a `.github/workflows/`, previa revisione umana |
 
-Il permesso `Contents: Read and write` è necessario per creare branch e pubblicare modifiche ai file; `Pull requests: Read and write` è necessario per aprire o gestire Pull Request. [16][25][30]
+`Contents: Read and write` è il permesso indispensabile per creare branch ed effettuare commit; `Pull requests: Read and write` è necessario per aprire o aggiornare una Pull Request. [36][42][43]
 
-### Recommended least-privilege profile
+### How to unlock write access
 
-Per questo framework si raccomanda la configurazione iniziale:
+#### Case 1 — GitHub App
+
+1. Accedi a GitHub come owner dell'App o come amministratore dell'organizzazione.
+2. Apri **Settings → Developer settings → GitHub Apps**.
+3. Seleziona l'App utilizzata dall'integrazione ChatGPT.
+4. Apri **Permissions & events**.
+5. Nella sezione **Repository permissions**, imposta:
+   - `Contents`: **Read and write**;
+   - `Pull requests`: **Read and write**;
+   - `Issues`: **Read** oppure **Read and write**, secondo necessità;
+   - `Workflows`: **Read and write**, solo se l'agente deve modificare GitHub Actions.
+6. Salva le modifiche.
+7. Apri l'installazione dell'App e **approva esplicitamente i nuovi permessi**.
+8. Verifica che il repository sia incluso in **Repository access**.
+
+GitHub richiede che ogni account o organizzazione dove l'App è installata approvi le nuove permission; finché questa approvazione non avviene, i permessi aggiornati non diventano effettivi. [32][34]
+
+#### Case 2 — Fine-grained Personal Access Token
+
+1. Apri **GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens**.
+2. Crea o modifica il token usato dall'integrazione.
+3. In **Repository access**, seleziona esplicitamente il repository target.
+4. In **Permissions → Repository permissions**, imposta:
+   - `Contents`: **Read and write**;
+   - `Pull requests`: **Read and write**;
+   - `Workflows`: **Read and write**, solo se necessario.
+5. Rigenera o salva il token, se richiesto.
+6. Aggiorna il token nella configurazione del connettore ChatGPT/MCP.
+
+I fine-grained PAT consentono di attribuire permessi granulari e di limitare l'accesso a specifici repository. [31][40]
+
+#### Case 3 — OAuth connection
+
+1. Revoca la connessione GitHub esistente, se non consente l'aggiornamento dei permessi.
+2. Riconnetti GitHub da ChatGPT o dal client MCP.
+3. Durante il consenso OAuth, verifica che siano richiesti gli scope equivalenti a:
+   - lettura e scrittura dei contenuti;
+   - lettura e scrittura delle Pull Request;
+   - eventuale scrittura dei workflow.
+4. Se gli scope proposti restano in sola lettura, utilizzare una GitHub App o un fine-grained PAT con i permessi sopra indicati.
+
+### Repository write policy
+
+Il framework adotta il principio del minimo privilegio e vieta di default le operazioni distruttive o ad alto impatto.
 
 ```yaml
 github_integration:
-  mode: "mcp"
+  mode: "chatgpt_mcp_or_github_app"
   default_access: "read_only"
 
   allowed_repositories:
@@ -243,86 +277,83 @@ github_integration:
     merge_pull_request: "human_approval"
     delete_branch: "denied"
     delete_repository: "denied"
+    modify_repository_settings: "denied"
+    modify_github_secrets: "denied"
 ```
 
-### Authority envelope example
+### Authorized GitHub operations
 
-Prima di una modifica al repository, l'agente deve materializzare un envelope simile al seguente:
+| Operazione | Default | Condizione |
+|---|---|---|
+| Leggere repository, file, issue e PR | Consentita | Repository autorizzato |
+| Ricercare codice e documentazione | Consentita | Repository autorizzato |
+| Creare un branch | Consentita | Branch conforme alla policy e permesso `Contents: write` |
+| Committare su feature branch | Consentita | Modifica dichiarata e permesso `Contents: write` |
+| Aprire Pull Request in draft | Consentita dopo conferma | Permessi `Contents: write` e `Pull requests: write` |
+| Modificare `.github/workflows/` | Richiede approvazione umana | Permessi `Contents: write` e `Workflows: write` |
+| Fare merge di una Pull Request | Richiede approvazione umana | Permessi e policy di merge |
+| Push diretto su `main` | Vietato | Richiede eccezione documentata e approvazione |
+| Cancellare branch, release o repository | Vietato | Non autorizzato di default |
 
-```json
-{
-  "action": "create_branch_and_pull_request",
-  "repository": "OWNER/llmops-agentic-professional-framework",
-  "source_branch": "main",
-  "target_branch": "docs/update-readme-github-integration",
-  "permitted_operations": [
-    "create_branch",
-    "create_or_update_file",
-    "create_pull_request"
-  ],
-  "forbidden_operations": [
-    "merge_pull_request",
-    "delete_branch",
-    "modify_repository_settings",
-    "modify_github_secrets",
-    "push_to_main"
-  ],
-  "approval_required": true,
-  "approval_scope": "branch_creation_and_draft_pull_request",
-  "rollback_strategy": "close_pull_request_and_delete_feature_branch",
-  "evidence": [
-    "README.md",
-    "docs/github-integration-policy.md"
-  ]
-}
-```
+### Dialogue protocol for repository changes
 
-### ChatGPT / MCP operating rule
+Quando l'utente chiede una modifica al repository, ChatGPT deve seguire questo protocollo:
 
-Quando l'utente chiede una pubblicazione o modifica su GitHub, l'agente deve:
+1. **Identificare il repository** e verificare che sia autorizzato.
+2. **Verificare i permessi effettivi** dell'integrazione prima di proporre operazioni di scrittura.
+3. **Proporre un piano**: branch, file interessati, modifiche previste, motivazione e rischi.
+4. **Mostrare un diff o riepilogo preciso** delle modifiche.
+5. **Richiedere conferma esplicita** per la creazione del branch, dei commit e della Pull Request.
+6. **Eseguire solo le azioni autorizzate**, senza mai superare il perimetro dichiarato.
+7. **Restituire evidenze**: URL della Pull Request, commit SHA, branch, stato e rollback point.
+8. **Registrare il trace**: richiesta, piano, evidenze, approvazione, esito, errori e azioni di rollback.
 
-1. Verificare che il repository sia incluso in `allowed_repositories`.
-2. Verificare che l'operazione rientri nel proprio `authority_envelope`.
-3. Proporre il nome del branch, i file interessati e un riepilogo delle modifiche.
-4. Richiedere conferma esplicita prima di creare branch, commit o Pull Request.
-5. Non effettuare mai push diretti su `main`.
-6. Aprire, di norma, una Pull Request in `draft`.
-7. Registrare nel trace: richiesta, piano, evidenze, diff, approvazione, esito e rollback point.
-
-Esempio di flusso approvato:
+### Example approved dialogue
 
 ```text
 USER
-→ "Aggiorna il README con la sezione GitHub Integration."
+→ "Aggiorna il README per documentare le autorizzazioni GitHub e permetti
+   la creazione di branch e Pull Request da ChatGPT."
 
 AGENT
-→ Analizza il repository.
-→ Propone branch: docs/update-readme-github-integration.
-→ Mostra il diff previsto.
-→ Richiede conferma.
+→ Repository: OWNER/llmops-agentic-professional-framework
+→ Branch proposto: docs/update-github-write-authorizations
+→ File modificato: README.md
+→ Operazioni: create_branch, update_file, create_draft_pull_request
+→ Non saranno eseguiti: merge, push su main, cancellazioni.
+
+→ Confermi la creazione del branch e della Pull Request in draft?
 
 USER
-→ "Approvo creazione branch e Pull Request in draft."
+→ "Sì, approvo branch e Pull Request in draft."
 
 AGENT
 → Crea il branch.
-→ Applica le modifiche.
+→ Applica le modifiche al README.
 → Apre la Pull Request in draft.
-→ Restituisce URL, commit SHA, stato e rollback point.
+→ Restituisce URL, commit SHA, stato e istruzioni di rollback.
 ```
 
-### Failure handling
+### Handling `403 Resource not accessible by integration`
 
-In caso di errore `403 Resource not accessible by integration`, l'agente deve:
+Se la creazione del branch restituisce:
+
+```text
+403 Resource not accessible by integration
+```
+
+l'agente deve:
 
 1. Non ripetere automaticamente la stessa chiamata.
-2. Classificare l'errore come **authorization failure**, non come errore tecnico generico.
-3. Verificare se il token/App è installato sul repository target.
-4. Verificare che `Contents`, `Pull requests` e, se necessario, `Workflows` siano abilitati in scrittura.
-5. Proporre all'utente l'intervento manuale via interfaccia GitHub o Git locale.
-6. Registrare l'evento nel trace di governance.
+2. Classificare l'errore come **authorization failure**.
+3. Verificare che `Contents` sia impostato su **Read and write**.
+4. Verificare che la GitHub App sia installata e autorizzata sul repository target.
+5. Verificare che l'utente abbia approvato i nuovi permessi dopo la modifica.
+6. Verificare che il repository sia incluso nel perimetro di accesso.
+7. Se il permesso `Pull requests: write` manca, proporre la creazione del branch e del commit, ma non della Pull Request.
+8. Se necessario, proporre l'intervento manuale tramite interfaccia GitHub o Git locale.
 
-L'errore indica in genere che l'integrazione dispone di lettura ma non del permesso di scrittura necessario per l'operazione richiesta. [3][16]
+L'errore indica che l'integrazione può leggere la risorsa ma non dispone dell'autorizzazione di scrittura necessaria per l'operazione richiesta. [32][34]
 
 ---
 
